@@ -3,28 +3,23 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"knucklebones/game"
 	"log"
 	"net/http"
-	"sync"
-	"time"
-
-	"knucklebones/game"
 
 	"github.com/gorilla/mux"
 )
 
-// GameServer manages the state of all active games
+// GameServer manages the state of a single active game
 type GameServer struct {
-	// games stores active games using a string ID as the key
-	games map[string]*game.GameState
-	// mutex prevents concurrent access to the games map
-	mutex sync.RWMutex
+	// The single game instance
+	game *game.GameState
 }
 
-// NewGameServer initializes a new game server
+// NewGameServer initializes a new game server with no active game
 func NewGameServer() *GameServer {
 	return &GameServer{
-		games: make(map[string]*game.GameState),
+		game: nil,
 	}
 }
 
@@ -48,7 +43,6 @@ type CreateGameRequest struct {
 }
 
 type GameResponse struct {
-	ID           string         `json:"id"`
 	CurrentState game.GameState `json:"state"`
 	Error        string         `json:"error,omitempty"`
 }
@@ -68,10 +62,11 @@ func NewRESTAdapter(gameServer *GameServer, port int) *RESTAdapter {
 		},
 	}
 
-	// Configure routes
-	router.HandleFunc("/games", adapter.handleCreateGame).Methods("POST")
-	router.HandleFunc("/games/{id}", adapter.handleGetGame).Methods("GET")
-	router.HandleFunc("/games/{id}/move", adapter.handleMakeMove).Methods("POST")
+	// Configure routes (no game IDs needed)
+	router.HandleFunc("/game", adapter.handleCreateGame).Methods("POST")
+	router.HandleFunc("/game", adapter.handleGetGame).Methods("GET")
+	router.HandleFunc("/game/move", adapter.handleMakeMove).Methods("POST")
+	router.HandleFunc("/game/complete", adapter.handleCompleteGame).Methods("POST")
 
 	return adapter
 }
@@ -85,7 +80,7 @@ func (a *RESTAdapter) Stop() error {
 	return a.server.Close()
 }
 
-// handleCreateGame creates a new game and returns its ID
+// handleCreateGame creates a new game
 func (a *RESTAdapter) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 	var req CreateGameRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -93,46 +88,39 @@ func (a *RESTAdapter) handleCreateGame(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create new game with unique ID (using timestamp for simplicity)
-	gameID := fmt.Sprintf("game_%d", time.Now().UnixNano())
-	game := game.NewGame(req.Player1Name, req.Player2Name)
+	// If a game already exists, return an error
+	if a.games.game != nil {
+		http.Error(w, "A game is already in progress", http.StatusBadRequest)
+		return
+	}
 
-	// Store the game
-	a.games.mutex.Lock()
-	a.games.games[gameID] = game
-	a.games.mutex.Unlock()
+	// Create new game
+	a.games.game = game.NewGame(req.Player1Name, req.Player2Name)
 
 	// Return the game state
 	json.NewEncoder(w).Encode(GameResponse{
-		ID:           gameID,
-		CurrentState: *game,
+		CurrentState: *a.games.game,
 	})
 }
 
-// handleGetGame returns the current state of a game
+// handleGetGame returns the current state of the game
 func (a *RESTAdapter) handleGetGame(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	gameID := vars["id"]
-
-	a.games.mutex.RLock()
-	game, exists := a.games.games[gameID]
-	a.games.mutex.RUnlock()
-
-	if !exists {
-		http.Error(w, "Game not found", http.StatusNotFound)
+	if a.games.game == nil {
+		http.Error(w, "No active game", http.StatusNotFound)
 		return
 	}
 
 	json.NewEncoder(w).Encode(GameResponse{
-		ID:           gameID,
-		CurrentState: *game,
+		CurrentState: *a.games.game,
 	})
 }
 
 // handleMakeMove processes a move in the game
 func (a *RESTAdapter) handleMakeMove(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	gameID := vars["id"]
+	if a.games.game == nil {
+		http.Error(w, "No active game", http.StatusNotFound)
+		return
+	}
 
 	var req MakeMoveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -140,32 +128,42 @@ func (a *RESTAdapter) handleMakeMove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.games.mutex.Lock()
-	game, exists := a.games.games[gameID]
-	if !exists {
-		a.games.mutex.Unlock()
-		http.Error(w, "Game not found", http.StatusNotFound)
-		return
-	}
-
-	err := game.MakeMove(req.Column)
-	a.games.mutex.Unlock()
+	err := a.games.game.MakeMove(req.Column)
 
 	if err != nil {
 		json.NewEncoder(w).Encode(GameResponse{
-			ID:           gameID,
-			CurrentState: *game,
+			CurrentState: *a.games.game,
 			Error:        err.Error(),
 		})
 		return
 	}
 
 	json.NewEncoder(w).Encode(GameResponse{
-		ID:           gameID,
-		CurrentState: *game,
+		CurrentState: *a.games.game,
 	})
 }
 
+// handleCompleteGame explicitly marks the game as complete and removes it
+func (a *RESTAdapter) handleCompleteGame(w http.ResponseWriter, r *http.Request) {
+	if a.games.game == nil {
+		http.Error(w, "No active game", http.StatusNotFound)
+		return
+	}
+
+	// Clear the game
+	a.games.game = nil
+
+	log.Printf("Game marked as complete and removed")
+
+	// Return success response
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "success",
+		"message": "Game successfully completed and resources released",
+	})
+}
+
+// For illustrative purposes - this should be removed in production as it's redundant
 func main() {
 	gameServer := NewGameServer()
 	restAdapter := NewRESTAdapter(gameServer, 8080)
